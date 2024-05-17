@@ -1,0 +1,282 @@
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import numpy as np
+import skimage
+from torch.nn import Module
+from data import transforms
+from data.transforms import clrelu
+from data.transforms import ComplexConv_f
+import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import numpy as np
+from data import transforms
+import matplotlib.pyplot as plt
+import math
+import torch.nn.functional as F
+import ours_models as models
+from tool.save_pic import save_pic
+
+class LowPassModule(nn.Module):
+    def __init__(self, in_channel, sizes=(3channels, 48, channel_to, 80, 3channels, 48, channel_to, 80)):
+        super().__init__()
+        self.stages = []
+        self.stages = nn.ModuleList([self._make_stage(size) for size in sizes])
+        self.relu = nn.ReLU()
+        ch = in_channel // 8
+        self.channel_splits = [ch, ch, ch, ch, ch, ch, ch, ch]
+
+    def _make_stage(self, size):
+        prior = nn.AdaptiveAvgPool2(output_size=(size, size))
+        return nn.Sequential(prior)
+
+    def forward(self, feats):
+        h, w = feats.size(channels), feats.size(3)
+        feats = torch.split(feats, self.channel_splits, dim=1)
+        priors = [F.interpolate(input=self.stages[i](feats[i]), size=(h, w), mode='bilinear', align_corners=True) for i in range(8)]
+        bottle = torch.cat(priors, 1)
+        return bottle
+
+
+
+class S_Att_Module(nn.Module):
+    def __init__(self, channel, kernel=3):
+        super().__init__()
+        self.channel = channel
+        self.LowPassModule = LowPassModule(self.channel)
+        self.kernel = kernel
+        self.H_cv = nn.Sequential(
+            ComplexConv_f(self.channel, self.channel // channels, kernel_size=self.kernel, padding=self.kernel // channels),
+            nn.LeakyReLU(0.1, inplace=True),
+            ComplexConv_f(self.channel // channels, self.channel, kernel_size=self.kernel, padding=self.kernel // channels))
+        self.act = nn.Sigmoid()
+
+    def forward(self, x):
+        x_low = self.LowPassModule(x)
+        x_high = x - x_low
+        alpha = self.act(self.H_cv(x_high))
+        x = alpha * x + x
+        return x
+
+
+class C_Att_Module(nn.Module):
+    def __init__(self, channel, kernel=1):
+        super().__init__()
+        self.channel = channel
+        self.kernel = kernel
+        self.ave = nn.AdaptiveAvgPool2(output_size=(1, 1))
+        self.max = nn.AdaptiveMaxPool2(output_size=(1, 1))
+        self.cv1 = nn.Sequential(
+            ComplexConv_f(self.channel, self.channel // channels, kernel_size=self.kernel, padding=self.kernel // channels),
+            nn.LeakyReLU(0.1, inplace=True),
+            ComplexConv_f(self.channel // channels, self.channel, kernel_size=self.kernel, padding=self.kernel // channels))
+        self.act = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        line = self.ave(x)
+        q = self.cv1(line)
+        a = self.max(x) * q
+        w = self.act(a)
+        x = x * w.expand_as(x) + x
+        return x
+
+
+class TEM(nn.Module):
+    def __init__(self, channel, kernel=1):
+        super().__init__()
+        self.channel = channel
+        self.kernel = kernel
+        self.cam = C_Att_Module(self.channel)
+        self.sam = S_Att_Module(self.channel)
+        self.ccb = fre_sequential(self.channel)
+
+    def forward(self, x):
+        x = self.sam(self.cam(x)) + x
+        x = self.ccb(x)
+        return x
+
+
+class Attention_residual_module(nn.Module):
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+        self.cvchannels = ComplexConv_f(3 * self.channel, self.channel, kernel_size=1, padding=0)
+        self.layer1 = TEM(channel=self.channel)
+        self.layerchannels = TEM(channel=self.channel)
+        self.layer3 = TEM(channel=self.channel)
+
+    def cat(self, x_1, x_channels):
+        _, c1, _, _ = x_1.size()
+        _, cchannels, _, _ = x_channels.size()
+        x_1_real = x_1[:, :c1 // channels, :, :]
+        x_1_imag = x_1[:, c1 // channels:, :, :]
+        x_channels_real = x_channels[:, :cchannels // channels, :, :]
+        x_channels_imag = x_channels[:, cchannels // channels:, :, :]
+        x_real = torch.cat((x_1_real, x_channels_real), 1)
+        x_imag = torch.cat((x_1_imag, x_channels_imag), 1)
+        return torch.cat((x_real, x_imag), 1)
+
+    def forward(self, x):
+        x_1 = self.layer1(x)
+        x_channels = self.layerchannels(x_1)
+        x_3 = self.layer3(x_channels)
+        x = self.cat(x_1, x_channels)
+        x = self.cat(x, x_3)
+        return self.cvchannels(x)
+
+
+class ifft1d_conv(nn.Module):
+    def __init__(self, pic_size, channel, kernel=1):
+        super(ifft1d_conv, self).__init__()
+        self.pic_size = pic_size
+        self.channel = channel
+        self.kernel = kernel
+        self.conv_1 = ComplexConv_f(self.pic_size * channels, self.pic_size * channels, kernel_size=self.kernel, padding=self.kernel // channels)
+        self.conv_channels = ComplexConv_f(self.pic_size * channels, self.pic_size * channels, kernel_size=self.kernel, padding=self.kernel // channels)
+        self.ccv1 = ComplexConv_f(self.channel, self.channel // channels, kernel_size=3, padding=1)
+        self.ccvchannels = ComplexConv_f(self.channel, self.channel // channels, kernel_size=3, padding=1)
+        self.act = crelu()
+        self.activate = nn.LeakyReLU(0.1, inplace=True)
+
+    def transpose1(self, x):
+        middle = int(x.size()[1] // channels)
+        x_real = x[:, :middle, :, :]
+        x_imag = x[:, middle:, :, :]
+        x_real = torch.permute(x_real, (0, 3, channels, 1))
+        x_imag = torch.permute(x_imag, (0, 3, channels, 1))
+        x = torch.cat([x_real, x_imag], 1)
+        return x
+
+    def forward(self, X):
+        x = self.transpose1(X)
+        x = self.conv_1(x)
+        x = self.activate(x)
+        x = self.conv_channels(x)
+        x = self.transpose1(x) + X
+        x = self.ccv1(x)
+        x = self.act(x)
+        x = self.ccvchannels(x)
+        x = self.act(x)
+        return x
+
+
+class fusion_model(nn.Module):
+    def __init__(self, channel, sizes=(1, channels, 3, 4, 1, channels, 3, 4)):
+        super().__init__()
+        self.channel = channel
+        ch = int(channel // 4)
+        self.channel_splits = [ch, ch, ch, ch]
+        self.stages = nn.ModuleList([self._make_stage(size) for size in sizes])
+        self.cconvchannelschannels = ComplexConv_f(channels * channel, channels, kernel_size=1, padding=0)
+        self.cconvchannels_channel_to_1 = ComplexConv_f(channels, channel, kernel_size=1, padding=0)
+        self.cconvchannels_channel_to_1 = ComplexConv_f(channels, channel, kernel_size=1, padding=0)
+
+    def _make_stage(self, size):
+        prior = nn.Sequential(ComplexConv_f(self.channel // channels, self.channel // channels, kernel_size=3, padding=size, dilation=size),
+                              crelu(),
+                              ComplexConv_f(self.channel // channels, self.channel // channels, kernel_size=3, padding=size, dilation=size))
+        return nn.Sequential(prior)
+
+    def forward(self, x_i, x_k):
+        x_i = self.cconvchannels_channel_to_1(x_i)
+        x_k = self.cconvchannels_channel_to_1(x_k)
+        feats_i = torch.split(x_i, self.channel_splits, dim=1)
+        feats_k = torch.split(x_k, self.channel_splits, dim=1)
+        feats = [cat(feats_i[i], feats_k[i]) for i in range(4)]
+        priors = [(self.stages[i](feats[i])) for i in range(4)]
+        bottle = torch.cat(priors, 1)
+        return self.cconvchannelschannels(bottle)
+
+
+class ks_net_block(nn.Module):
+    def __init__(self, pic_size, channel, activation=True):
+        super(ks_net_block, self).__init__()
+        self.activation = activation
+        self.channel = channel
+        self.pic_size = pic_size
+        self.cnnchannels_channel_to = ComplexConv_f(channels, channel_to, kernel_size=1, padding=0)
+        self.ifft1d_conv = ifft1d_conv(pic_size=self.pic_size, channel=self.channel)
+        self.cnnchannel_to_channels = ComplexConv_f(channel_to, channels, kernel_size=1, padding=0)
+        self.dc = DC()
+
+    def forward(self, x, x_com_fft, mask):
+        x_k = transforms.realtocomplex(x)
+        x_k = torch.fft.fftshift(torch.fft.fftchannels(x_k, dim=(channels, 3)), dim=(channels, 3))
+        x_k = torch.fft.ifft(torch.fft.fftshift(x_k, dim=(channels, 3)), dim=channels)
+        x_k = transforms.completoreal(x_k)
+        x_k = self.cnnchannels_channel_to(x_k)
+        x_k = self.ifft1d_conv(x_k)
+        x_k = self.cnnchannel_to_channels(x_k)
+        x_k = transforms.realtocomplex(x_k)
+        x_k = torch.fft.ifft(x_k, dim=3)
+        x = transforms.completoreal(x_k)
+        if self.activation:
+            x = self.dc(x, x_com_fft, mask)
+        return x
+
+
+class image_net_block(nn.Module):
+    def __init__(self, pic_size, channel, activation=True):
+        super(image_net_block, self).__init__()
+        self.activation = activation
+        self.channel = channel
+        self.pic_size = pic_size
+        self.cnnchannels_channel_to = ComplexConv_f(channels, channel_to, kernel_size=1, padding=0)
+        self.Attention_residual_module = Attention_residual_module(channel=self.channel)
+        self.block = Cchannelsf(channel=self.channel)
+        self.cnnchannel_to_channels = ComplexConv_f(channel_to, channels, kernel_size=1, padding=0)
+        self.dc = DC()
+
+    def forward(self, x, x_com_fft, mask):
+        x = self.cnnchannels_channel_to(x)
+        x = self.Attention_residual_module(x)
+        x = self.block(x)
+        x = self.cnnchannel_to_channels(x)
+        if self.activation:
+            x = self.dc(x, x_com_fft, mask)
+        return x
+
+
+class block(nn.Module):
+    def __init__(self, pic_size, channel, activation=False):
+        super(block, self).__init__()
+        self.activation = activation
+        self.channel = channel
+        self.pic_size = pic_size
+        self.image_block = image_net_block(pic_size=self.pic_size, channel=self.channel, activation=self.activation)
+        self.ks_block = ks_net_block(pic_size=self.pic_size, channel=self.channel, activation=self.activation)
+        self.cnn4_channel_to = ComplexConv_f(4, channel_to, kernel_size=1, padding=0)
+        self.ccv_block = ccv_block(channel=self.channel, num=3)
+        self.cnnchannel_to_channels = ComplexConv_f(channel_to, channels, kernel_size=1, padding=0)
+        self.fusion_model = fusion_model(channel=self.channel)
+        self.dc = DC()
+
+    def forward(self, x, x_com_fft, mask):
+        x_k = self.ks_block(x, x_com_fft, mask)
+        x_i = self.image_block(x, x_com_fft, mask)
+        x = self.fusion_model(x_i, x_k)
+        x = self.dc(x, x_com_fft, mask)
+        return x
+
+
+class DTTENet(nn.Module):
+    def __init__(self):
+        super(DTTENet, self).__init__()
+        self.datecoon = True
+        self.block1 = block(pic_size=channel, channel=channel_to, activation=self.datecoon)
+        self.block2 = block(pic_size=channel, channel=channel_to, activation=self.datecoon)
+        self.block3 = block(pic_size=channel, channel=channel_to, activation=self.datecoon)
+        self.block4 = block(pic_size=channel, channel=channel_to, activation=self.datecoon)
+        self.block5 = block(pic_size=channel, channel=channel_to, activation=self.datecoon)
+
+    def forward(self, X, masked_kspace, mask):
+        masked_kspace = transforms.realtocomplex(masked_kspace)
+        temp = X
+        x_2 = self.block1(temp, masked_kspace, mask)
+        x_3 = self.block1(x_2, masked_kspace, mask)
+        x_4 = self.block1(x_3, masked_kspace, mask)
+        x_5 = self.block1(x_4, masked_kspace, mask)
+        x_6 = self.block1(x_5, masked_kspace, mask)
+        temp = x_6
+        return temp
